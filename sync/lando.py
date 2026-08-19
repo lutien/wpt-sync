@@ -11,6 +11,7 @@ git2hg_cache: dict[str, str] = {}
 class Lando:
     def __init__(self, config: Mapping[str, Any]):
         self.base_url = config["lando"]["url"]
+        self.api_try_token = config["lando"]["try_api_token"]
 
     def get(self, path: str) -> Optional[Mapping[str, Any]]:
         exc = None
@@ -33,6 +34,45 @@ class Lando:
             return data
         assert exc is not None
         raise exc
+
+    def try_push(
+        self,
+        patches: list[str],
+        base_commit: str,
+        base_commit_vcs: str = "hg",
+        patch_format: str = "git-format-patch",
+        repo_name: str = "try",
+    ) -> int:
+        body = {
+            "base_commit": base_commit,
+            "base_commit_vcs": base_commit_vcs,
+            "patch_format": patch_format,
+            "patches": patches,
+            "repo_name": repo_name,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_try_token}",
+            "Content-Type": "application/json",
+        }
+        responce = requests.post(
+            urljoin(self.base_url, "/api/try/patches"), headers=headers, json=body
+        )
+        try:
+            data = responce.json()
+        except ValueError:
+            data = None
+        if data is None or not isinstance(data.get("id"), int):
+            raise ValueError(f"Lando response missing id property: {data}")
+
+        return data["id"]
+
+    def landing_job(self, job_id: int) -> Mapping[str, Any]:
+        """Get the current state of a Lando landing job"""
+        data = self.get(f"/landing_jobs/{job_id}")
+        if data is None:
+            raise ValueError(f"Lando has no job with id {job_id}")
+
+        return data
 
     def hg2git(self, hg_hash: str) -> Optional[str]:
         data = self.get(f"/api/hg2git/firefox/{hg_hash}")
@@ -61,6 +101,37 @@ class MockLando(Lando):
         super().__init__(config)
         self.hg_to_git: dict[str, Optional[str]] = {}
         self.git_to_hg: dict[str, Optional[str]] = {}
+        self.try_pushes: list[Mapping[str, Any]] = []
+
+    def try_push(
+        self,
+        patches: list[str],
+        base_commit: str,
+        base_commit_vcs: str = "hg",
+        patch_format: str = "git-format-patch",
+        repo_name: str = "try",
+    ) -> int:
+        self.try_pushes.append(
+            {
+                "base_commit": base_commit,
+                "base_commit_vcs": base_commit_vcs,
+                "patch_format": patch_format,
+                "patches": patches,
+                "repo_name": repo_name,
+            }
+        )
+        return len(self.try_pushes)
+
+    def landing_job(self, job_id: int) -> Mapping[str, Any]:
+        if not 0 < job_id <= len(self.try_pushes):
+            raise ValueError(f"Lando has no job with id {job_id}")
+        return {
+            "id": job_id,
+            "status": "LANDED",
+            "commit_id": "%040x" % job_id,
+            "error": "",
+            "url": urljoin(self.base_url, f"/landings/{job_id}"),
+        }
 
     def hg2git(self, hg_hash: str) -> Optional[str]:
         return self.hg_to_git.get(hg_hash)

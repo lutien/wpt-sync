@@ -1,7 +1,46 @@
+import base64
+import json
+import re
 from unittest.mock import Mock, patch
 
-from sync import tc
+from sync import tc, trypush
 from sync.lock import SyncLock
+from conftest import mach_try_output
+
+
+def test_read_try_task_config(env, git_gecko):
+    try_commit = trypush.TryFuzzyCommit(git_gecko, git_gecko, None, 0, hacks=False)
+    message, try_task_config = try_commit.read_try_task_config(
+        mach_try_output.decode("utf8", "replace")
+    )
+
+    assert message.startswith("Fuzzy query=web-platform-tests")
+    assert message.endswith("Pushed via `mach try fuzzy`")
+    assert json.loads(try_task_config)["parameters"]["try_task_config"]["tasks"] == [
+        "test-linux2404-64/debug-web-platform-tests-1",
+        "test-linux2404-64/opt-web-platform-tests-1",
+    ]
+
+
+def test_read_try_rev(env, git_gecko):
+    try_commit = trypush.TryFuzzyCommit(git_gecko, git_gecko, None, 0, hacks=False)
+    job_id = env.lando.try_push(["patch"], "0" * 40)
+
+    assert try_commit.read_try_rev(job_id) == "%040x" % job_id
+
+
+def test_try_push_patches(env, try_push):
+    assert len(env.lando.try_pushes) == 1
+    lando_push = env.lando.try_pushes[0]
+
+    assert lando_push["repo_name"] == "try"
+    assert lando_push["patch_format"] == "git-format-patch"
+    assert lando_push["base_commit_vcs"] == "hg"
+    assert re.match("^[0-9a-f]{40}$", lando_push["base_commit"])
+
+    patches = [base64.b64decode(item).decode("utf8") for item in lando_push["patches"]]
+    assert patches
+    assert "try_task_config.json" in patches[-1]
 
 
 def test_try_task_states(mock_tasks, try_push):

@@ -1,8 +1,11 @@
 from __future__ import annotations
+import base64
+import json
 import os
 import re
 import shutil
 import subprocess
+import time
 import traceback
 from collections import defaultdict
 
@@ -37,7 +40,13 @@ logger = log.get_logger(__name__)
 env = Environment()
 
 auth_tc = tc.TaskclusterClient()
-rev_re = re.compile("revision=(?P<rev>[0-9a-f]{40})")
+try_output_re = re.compile(
+    r"^Commit message:\n(?P<message>.*?)\n^Calculated try_task_config\.json:\n",
+    re.MULTILINE | re.DOTALL,
+)
+try_task_config_path = "try_task_config.json"
+lando_poll_interval = 10
+lando_poll_timeout = 30 * 60
 
 
 class TryCommit:
@@ -48,6 +57,7 @@ class TryCommit:
         tests_by_type: Mapping[str, list[str]] | None,
         rebuild: int,
         hacks: bool = True,
+        base: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.git_gecko = git_gecko
@@ -55,6 +65,7 @@ class TryCommit:
         self.tests_by_type = tests_by_type
         self.rebuild = rebuild
         self.hacks = hacks
+        self.base = base
         self.try_rev = None
         self.extra_args = kwargs
         self.reset: str | None = None
@@ -96,34 +107,39 @@ class TryCommit:
                 self.worktree.index.add([tc_config])
 
     def push(self) -> str:
-        status, output = self._push()
-        return self.read_treeherder(status, output)
+        job_id = self._push()
+        return self.read_try_rev(job_id)
 
-    def _push(self) -> tuple[int, str]:
+    def _push(self) -> int:
         raise NotImplementedError
 
-    def read_treeherder(self, status: int, output: str) -> str:
-        msg = f"Failed to push to try:\n{output}"
-        try_rev: str | None = None
-        if status != 0:
-            logger.error(msg)
-            raise RetryableError(AbortError(msg))
-        rev_match = rev_re.search(output)
-        if not rev_match:
-            logger.warning(f"No revision found in string:\n\n{output}\n")
-            # Assume that the revision is HEAD
-            # This happens in tests and isn't a problem, but would be in real code,
-            # so that's not ideal
-            try:
-                try_rev = cinnabar(self.git_gecko).git2hg(self.worktree.head.commit.hexsha)
-            except ValueError:
-                pass
-        else:
-            try_rev = rev_match.group("rev")
-        if try_rev is None:
-            logger.error(msg)
-            raise AbortError(msg)
-        return try_rev
+    def read_try_rev(self, job_id: int) -> str:
+        """Wait for Lando to apply the patches we pushed and return the revision
+        it created on try"""
+        deadline = time.monotonic() + lando_poll_timeout
+        while True:
+            job = env.lando.landing_job(job_id)
+            status = job.get("status")
+            if status == "LANDED":
+                try_rev = job.get("commit_id")
+                if not isinstance(try_rev, str):
+                    msg = f"Lando job {job_id} landed without a revision:\n{job}"
+                    logger.error(msg)
+                    raise AbortError(msg)
+                return try_rev
+            if status in ("FAILED", "CANCELLED"):
+                msg = f"Lando job {job_id} for the try push is {status}:\n{job.get('error')}"
+                logger.error(msg)
+                raise AbortError(msg)
+            if time.monotonic() > deadline:
+                msg = (
+                    f"Timed out waiting for Lando job {job_id} to land the try push; "
+                    f"last status was {status}. See {job.get('url')}"
+                )
+                logger.error(msg)
+                raise AbortError(msg)
+            logger.info(f"Waiting for Lando job {job_id} to land the try push, status {status}")
+            time.sleep(lando_poll_interval)
 
 
 class TryFuzzyCommit(TryCommit):
@@ -134,9 +150,12 @@ class TryFuzzyCommit(TryCommit):
         tests_by_type: Mapping[str, list[str]] | None,
         rebuild: int,
         hacks: bool = True,
+        base: str | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(git_gecko, worktree, tests_by_type, rebuild, hacks=hacks, **kwargs)
+        super().__init__(
+            git_gecko, worktree, tests_by_type, rebuild, hacks=hacks, base=base, **kwargs
+        )
         self.queries = self.extra_args.get(
             "queries", ["web-platform-tests !macosx !shippable !asan !tsan"]
         )
@@ -147,14 +166,24 @@ class TryFuzzyCommit(TryCommit):
         self.artifact = self.extra_args.get("artifact", True)
 
     def create(self) -> None:
+        self.reset = self.worktree.head.commit.hexsha
         if self.hacks:
-            self.reset = self.worktree.head.commit.hexsha
             self.apply_hacks()
             # TODO add something useful to the commit message here since that will
             # appear in email &c.
             self.worktree.index.commit(message="Apply task hacks before running try")
 
-    def _push(self) -> tuple[int, str]:
+    def _push(self) -> int:
+        status, output = self.run_mach_try()
+        if status != 0:
+            msg = f"Failed to run mach try:\n{output}"
+            logger.error(msg)
+            raise RetryableError(AbortError(msg))
+        message, try_task_config = self.read_try_task_config(output)
+        self.create_try_commit(message, try_task_config)
+        return self.push_to_lando()
+
+    def run_mach_try(self) -> tuple[int, str]:
         self.worktree.git.reset("--hard")
 
         working_dir = self.worktree.working_dir
@@ -172,7 +201,8 @@ class TryFuzzyCommit(TryCommit):
         query_args = []
         for query in self.queries:
             query_args.extend(["-q", query])
-        logger.info("Pushing to try with fuzzy query: %s" % " ".join(query_args))
+
+        logger.info("Creating try commit with fuzzy query: %s" % " ".join(query_args))
 
         can_push_routes = b"--route " in mach.try_("fuzzy", "--help")
 
@@ -191,8 +221,9 @@ class TryFuzzyCommit(TryCommit):
         else:
             args.append("--no-artifact")
 
-        # --push-to-vcs is required to push directly to hgmo
-        args.append("--push-to-vcs")
+        # --no-push means mach only computes the try_task_config.json and the commit
+        # message; making the commit and pushing it to try is handled here instead
+        args.append("--no-push")
 
         if self.tests_by_type is not None:
             paths = []
@@ -212,7 +243,78 @@ class TryFuzzyCommit(TryCommit):
             output = mach.try_(*args, stderr=subprocess.STDOUT)
             return 0, output.decode("utf8", "replace")
         except subprocess.CalledProcessError as e:
-            return e.returncode, e.output
+            return e.returncode, e.output.decode("utf8", "replace")
+
+    def read_try_task_config(self, output: str) -> tuple[str, str]:
+        """Read the commit message and the try_task_config.json content from the
+        output of `mach try fuzzy --no-push`
+
+        :return: Tuple of (commit message, try_task_config.json content)
+        """
+        match = try_output_re.search(output)
+        if match is None:
+            msg = f"Failed to read the try commit message from mach output:\n{output}"
+            logger.error(msg)
+            raise AbortError(msg)
+        try:
+            # The config is the first JSON object after the header line, but it's
+            # followed by other output, so just decode as much as parses
+            try_task_config, _ = json.JSONDecoder().raw_decode(output[match.end() :])
+        except ValueError:
+            msg = f"Failed to read try_task_config.json from mach output:\n{output}"
+            logger.error(msg)
+            raise AbortError(msg)
+
+        content = (
+            json.dumps(try_task_config, indent=4, separators=(",", ": "), sort_keys=True) + "\n"
+        )
+        return match.group("message"), content
+
+    def create_try_commit(self, message: str, try_task_config: str) -> None:
+        working_dir = self.worktree.working_dir
+        assert working_dir is not None
+
+        with open(os.path.join(working_dir, try_task_config_path), "w") as f:
+            f.write(try_task_config)
+        self.worktree.index.add([try_task_config_path])
+        self.worktree.index.commit(message=message)
+        logger.info(
+            "Created try commit %s with message:\n%s" % (self.worktree.head.commit.hexsha, message)
+        )
+
+    def push_to_lando(self) -> int:
+        if self.base is None:
+            raise AbortError("Can't push to try without a base commit")
+
+        try:
+            base_commit = cinnabar(self.git_gecko).git2hg(self.base)
+        except ValueError as e:
+            msg = f"Failed to get the hg revision of the base commit {self.base}:\n{e}"
+            logger.error(msg)
+            raise AbortError(msg)
+        patches = [
+            base64.b64encode(patch).decode("ascii") for patch in self.commit_patches(self.base)
+        ]
+        logger.info("Pushing %d commits to try on top of %s" % (len(patches), base_commit))
+        try:
+            job_id = env.lando.try_push(patches, base_commit)
+        except Exception as e:
+            msg = f"Failed to push to try:\n{e}"
+            logger.error(msg)
+            raise RetryableError(AbortError(msg))
+        logger.info("Pushed to try as Lando job %s" % job_id)
+        return job_id
+
+    def commit_patches(self, base: str) -> list[bytes]:
+        revs = self.worktree.git.rev_list("--reverse", f"{base}..HEAD").splitlines()
+        if not revs:
+            raise AbortError(f"No commits to push to try between {base} and the try commit")
+        return [
+            self.worktree.git.format_patch(
+                rev, "-1", "--always", "--stdout", "--no-base", stdout_as_string=False
+            )
+            for rev in revs
+        ]
 
 
 class TryPush(base.ProcessData):
@@ -262,7 +364,13 @@ class TryPush(base.ProcessData):
                 logger.error("Could not find config for Stability rebuild count, using default 5")
                 rebuild_count = 5
         with try_cls(
-            sync.git_gecko, git_work, affected_tests, rebuild_count, hacks=hacks, **kwargs
+            sync.git_gecko,
+            git_work,
+            affected_tests,
+            rebuild_count,
+            hacks=hacks,
+            base=sync.gecko_commits.base.sha1,
+            **kwargs,
         ) as c:
             try_rev = c.push()
 

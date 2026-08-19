@@ -144,7 +144,7 @@ def test_wpt_pr_approved(
         assert sync.latest_try_push is None
 
         # If we 'merge' the PR, then we will see a stability try push
-        with patch.object(trypush.TryCommit, "read_treeherder", autospec=True) as mock_read:
+        with patch.object(trypush.TryCommit, "read_try_rev", autospec=True) as mock_read:
             mock_read.return_value = "0000000000000000"
             handlers.handle_pr(
                 git_gecko,

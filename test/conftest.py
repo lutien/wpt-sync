@@ -33,6 +33,35 @@ from sync.lock import SyncLock
 
 here = os.path.abspath(os.path.dirname(__file__))
 
+mach_try_output = b"""warning: paths to individual tests may not work, re-writing to \
+testing/web-platform/tests/example. Pass --allow-testfile-path to override
+Commit message:
+Fuzzy query=web-platform-tests !macosx !shippable !asan !tsan\
+&paths=testing/web-platform/tests/example
+
+mach try command: `./mach try fuzzy -q "web-platform-tests !macosx !shippable !asan !tsan" \
+--artifact --no-push`
+
+Pushed via `mach try fuzzy`
+Calculated try_task_config.json:
+{
+    "parameters": {
+        "optimize_target_tasks": false,
+        "try_task_config": {
+            "env": {
+                "TRY_SELECTOR": "fuzzy"
+            },
+            "tasks": [
+                "test-linux2404-64/debug-web-platform-tests-1",
+                "test-linux2404-64/opt-web-platform-tests-1"
+            ],
+            "use-artifact-builds": true
+        }
+    },
+    "version": 2
+}
+"""
+
 
 def create_file_data(file_data, repo_workdir, repo_prefix=None):
     add_paths = []
@@ -512,6 +541,7 @@ def mock_mach():
     from sync import projectutil
 
     cls = projectutil.create_mock("mach")
+    cls.set_data("try", mach_try_output)
     projectutil.Mach = cls
     return cls
 
@@ -680,7 +710,7 @@ def try_push(
 
     trypush.Mach = mock_mach
     with patch("sync.tree.is_open", Mock(return_value=True)):
-        with patch.object(trypush.TryCommit, "read_treeherder", autospec=True) as mock_read:
+        with patch.object(trypush.TryCommit, "read_try_rev", autospec=True) as mock_read:
             mock_read.return_value = "0000000000000000"
             downstream.new_wpt_pr(git_gecko, git_wpt, pr)
             sync = set_pr_status(pr.number, "success")

@@ -44,7 +44,6 @@ try_output_re = re.compile(
     r"^Commit message:\n(?P<message>.*?)\n^Calculated try_task_config\.json:\n",
     re.MULTILINE | re.DOTALL,
 )
-try_task_config_path = "try_task_config.json"
 lando_poll_interval = 10
 lando_poll_timeout = 30 * 60
 
@@ -274,6 +273,7 @@ class TryFuzzyCommit(TryCommit):
         working_dir = self.worktree.working_dir
         assert working_dir is not None
 
+        try_task_config_path = "try_task_config.json"
         with open(os.path.join(working_dir, try_task_config_path), "w") as f:
             f.write(try_task_config)
         self.worktree.index.add([try_task_config_path])
@@ -306,14 +306,14 @@ class TryFuzzyCommit(TryCommit):
         return job_id
 
     def commit_patches(self, base: str) -> list[bytes]:
-        revs = self.worktree.git.rev_list("--reverse", f"{base}..HEAD").splitlines()
-        if not revs:
+        commits = list(self.worktree.iter_commits(f"{base}..HEAD", reverse=True))
+        if not commits:
             raise AbortError(f"No commits to push to try between {base} and the try commit")
         return [
             self.worktree.git.format_patch(
-                rev, "-1", "--always", "--stdout", "--no-base", stdout_as_string=False
+                commit.hexsha, "-1", "--always", "--stdout", "--no-base", stdout_as_string=False
             )
-            for rev in revs
+            for commit in commits
         ]
 
 

@@ -13,10 +13,19 @@ class Lando:
         self.base_url = config["lando"]["url"]
         self.api_try_token = config["lando"]["try_api_token"]
 
-    def get(self, path: str) -> Optional[Mapping[str, Any]]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        retry_count: int = 1,
+        headers: Optional[Mapping[str, str]] = None,
+        body: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Mapping[str, Any]]:
         exc = None
-        for _retry_count in range(5):
-            resp = requests.get(urljoin(self.base_url, path))
+        for _retry_count in range(retry_count):
+            resp = requests.request(
+                method, urljoin(self.base_url, path), headers=headers, json=body
+            )
             if resp.status_code == 404:
                 return None
             try:
@@ -39,28 +48,16 @@ class Lando:
         self,
         patches: list[str],
         base_commit: str,
-        base_commit_vcs: str = "hg",
-        patch_format: str = "git-format-patch",
-        repo_name: str = "try",
     ) -> int:
         body = {
             "base_commit": base_commit,
-            "base_commit_vcs": base_commit_vcs,
-            "patch_format": patch_format,
+            "base_commit_vcs": "hg",
+            "patch_format": "git-format-patch",
             "patches": patches,
-            "repo_name": repo_name,
+            "repo_name": "try",
         }
-        headers = {
-            "Authorization": f"Bearer {self.api_try_token}",
-            "Content-Type": "application/json",
-        }
-        responce = requests.post(
-            urljoin(self.base_url, "/api/try/patches"), headers=headers, json=body
-        )
-        try:
-            data = responce.json()
-        except ValueError:
-            data = None
+        headers = {"Authorization": f"Bearer {self.api_try_token}"}
+        data = self.request("POST", "/api/try/patches", headers=headers, body=body)
         if data is None or not isinstance(data.get("id"), int):
             raise ValueError(f"Lando response missing id property: {data}")
 
@@ -68,14 +65,14 @@ class Lando:
 
     def landing_job(self, job_id: int) -> Mapping[str, Any]:
         """Get the current state of a Lando landing job"""
-        data = self.get(f"/landing_jobs/{job_id}")
+        data = self.request("GET", f"/landing_jobs/{job_id}", retry_count=5)
         if data is None:
             raise ValueError(f"Lando has no job with id {job_id}")
 
         return data
 
     def hg2git(self, hg_hash: str) -> Optional[str]:
-        data = self.get(f"/api/hg2git/firefox/{hg_hash}")
+        data = self.request("GET", f"/api/hg2git/firefox/{hg_hash}", retry_count=5)
         if data is None:
             return None
         if not isinstance(data.get("git_hash"), str):
@@ -85,7 +82,7 @@ class Lando:
 
     def git2hg(self, git_hash: str) -> Optional[str]:
         if git_hash not in git2hg_cache:
-            data = self.get(f"/api/git2hg/firefox/{git_hash}")
+            data = self.request("GET", f"/api/git2hg/firefox/{git_hash}", retry_count=5)
             if data is None:
                 return None
             if not isinstance(data.get("hg_hash"), str):
@@ -107,17 +104,14 @@ class MockLando(Lando):
         self,
         patches: list[str],
         base_commit: str,
-        base_commit_vcs: str = "hg",
-        patch_format: str = "git-format-patch",
-        repo_name: str = "try",
     ) -> int:
         self.try_pushes.append(
             {
                 "base_commit": base_commit,
-                "base_commit_vcs": base_commit_vcs,
-                "patch_format": patch_format,
+                "base_commit_vcs": "hg",
+                "patch_format": "git-format-patch",
                 "patches": patches,
-                "repo_name": repo_name,
+                "repo_name": "try",
             }
         )
         return len(self.try_pushes)

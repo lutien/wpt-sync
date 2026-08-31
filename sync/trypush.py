@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 import traceback
+import uuid
 from collections import defaultdict
 
 import taskcluster
@@ -20,7 +21,7 @@ from .env import Environment
 from .errors import AbortError, RetryableError
 from .index import TaskGroupIndex, TryCommitIndex
 from .load import get_syncs
-from .lock import constructor, mut
+from .lock import SyncLock, constructor, mut
 from .projectutil import Mach
 from .repos import cinnabar
 from .sync import SyncProcess
@@ -32,7 +33,6 @@ from git.repo.base import Repo
 if TYPE_CHECKING:
     from sync.downstream import DownstreamSync
     from sync.landing import LandingSync
-    from sync.lock import SyncLock
     from sync.tc import TaskGroup
 
 
@@ -44,8 +44,22 @@ try_output_re = re.compile(
     r"^Commit message:\n(?P<message>.*?)\n^Calculated try_task_config\.json:\n",
     re.MULTILINE | re.DOTALL,
 )
-lando_poll_interval = 10
-lando_poll_timeout = 30 * 60
+
+
+def try_rev_from_job(job_id: int, job: Mapping[str, Any]) -> str | None:
+    status = job.get("status")
+    if status == "LANDED":
+        try_rev = job.get("commit_id")
+        if not isinstance(try_rev, str):
+            msg = f"Lando job {job_id} landed without a revision:\n{job}"
+            logger.error(msg)
+            raise AbortError(msg)
+        return try_rev
+    if status in ("FAILED", "CANCELLED"):
+        msg = f"Lando job {job_id} for the try push is {status}:\n{job.get('error')}"
+        logger.error(msg)
+        raise AbortError(msg)
+    return None
 
 
 class TryCommit:
@@ -57,6 +71,7 @@ class TryCommit:
         rebuild: int,
         hacks: bool = True,
         base: str | None = None,
+        token: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.git_gecko = git_gecko
@@ -65,6 +80,7 @@ class TryCommit:
         self.rebuild = rebuild
         self.hacks = hacks
         self.base = base
+        self.token = token
         self.try_rev = None
         self.extra_args = kwargs
         self.reset: str | None = None
@@ -105,40 +121,39 @@ class TryCommit:
 
                 self.worktree.index.add([tc_config])
 
-    def push(self) -> str:
+    def push(self) -> tuple[int, str | None]:
+        """Push to try.
+
+        :return: Tuple of (Lando job id, revision on try). The revision is None if
+                 Lando hasn't landed the commits yet.
+        """
         job_id = self._push()
-        return self.read_try_rev(job_id)
+        return job_id, self.read_try_rev(job_id)
 
     def _push(self) -> int:
         raise NotImplementedError
 
-    def read_try_rev(self, job_id: int) -> str:
+    def read_try_rev(self, job_id: int) -> str | None:
         """Wait for Lando to apply the patches we pushed and return the revision
-        it created on try"""
-        deadline = time.monotonic() + lando_poll_timeout
+        it created on try.
+
+        :return: The revision on try, or None if the job hasn't landed yet
+        """
+        deadline = time.monotonic() + 60
         while True:
             job = env.lando.landing_job(job_id)
-            status = job.get("status")
-            if status == "LANDED":
-                try_rev = job.get("commit_id")
-                if not isinstance(try_rev, str):
-                    msg = f"Lando job {job_id} landed without a revision:\n{job}"
-                    logger.error(msg)
-                    raise AbortError(msg)
+            try_rev = try_rev_from_job(job_id, job)
+            if try_rev is not None:
                 return try_rev
-            if status in ("FAILED", "CANCELLED"):
-                msg = f"Lando job {job_id} for the try push is {status}:\n{job.get('error')}"
-                logger.error(msg)
-                raise AbortError(msg)
+            status = job.get("status")
             if time.monotonic() > deadline:
-                msg = (
-                    f"Timed out waiting for Lando job {job_id} to land the try push; "
-                    f"last status was {status}. See {job.get('url')}"
+                logger.info(
+                    f"Lando job {job_id} hasn't landed the try push yet; last status was "
+                    f"{status}. Waiting for the decision task instead. See {job.get('url')}"
                 )
-                logger.error(msg)
-                raise AbortError(msg)
+                return None
             logger.info(f"Waiting for Lando job {job_id} to land the try push, status {status}")
-            time.sleep(lando_poll_interval)
+            time.sleep(10)
 
 
 class TryFuzzyCommit(TryCommit):
@@ -150,10 +165,18 @@ class TryFuzzyCommit(TryCommit):
         rebuild: int,
         hacks: bool = True,
         base: str | None = None,
+        token: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
-            git_gecko, worktree, tests_by_type, rebuild, hacks=hacks, base=base, **kwargs
+            git_gecko,
+            worktree,
+            tests_by_type,
+            rebuild,
+            hacks=hacks,
+            base=base,
+            token=token,
+            **kwargs,
         )
         self.queries = self.extra_args.get(
             "queries", ["web-platform-tests !macosx !shippable !asan !tsan"]
@@ -273,6 +296,11 @@ class TryFuzzyCommit(TryCommit):
         working_dir = self.worktree.working_dir
         assert working_dir is not None
 
+        if self.token is not None:
+            # This is the last commit in the push, so its message is the one that's
+            # passed to the decision task.
+            message = f"{message}\n\n{f'wptsync-try-push: {self.token}'}"
+
         try_task_config_path = "try_task_config.json"
         with open(os.path.join(working_dir, try_task_config_path), "w") as f:
             f.write(try_task_config)
@@ -358,6 +386,9 @@ class TryPush(base.ProcessData):
 
         git_work = sync.gecko_worktree.get()
 
+        sync_id = str(getattr(sync, sync.obj_id))
+        token = f"{sync.sync_type}/{sync_id}/{uuid.uuid4()}"
+
         if rebuild_count is None:
             rebuild_count = 0 if not stability else env.config["gecko"]["try"]["stability_count"]
             if not isinstance(rebuild_count, int):
@@ -370,12 +401,15 @@ class TryPush(base.ProcessData):
             rebuild_count,
             hacks=hacks,
             base=sync.gecko_commits.base.sha1,
+            token=token,
             **kwargs,
         ) as c:
-            try_rev = c.push()
+            job_id, try_rev = c.push()
 
         data = {
             "try-rev": try_rev,
+            "try-token": token,
+            "lando-job-id": job_id,
             "stability": stability,
             "gecko-head": sync.gecko_commits.head.sha1,
             "wpt-head": sync.wpt_commits.head.sha1,
@@ -386,16 +420,24 @@ class TryPush(base.ProcessData):
             sync.git_gecko, cls.obj_type, sync.sync_type, str(getattr(sync, sync.obj_id))
         )
         rv = super().create(lock, sync.git_gecko, process_name, data)
-        try_idx.insert(try_idx.make_key(try_rev), process_name)
+        if try_rev is not None:
+            try_idx.insert(try_idx.make_key(try_rev), process_name)
 
         with rv.as_mut(lock):
             rv.created = taskcluster.fromNowJSON("0 days")
 
         if sync.bug is not None:
-            env.bz.comment(
-                sync.bug,
-                "Pushed to try%s %s" % (" (stability)" if stability else "", rv.treeherder_url),
-            )
+            if try_rev is not None:
+                env.bz.comment(
+                    sync.bug,
+                    f"Pushed to try{' (stability)' if stability else ''} {rv.treeherder_url}",
+                )
+            else:
+                env.bz.comment(
+                    sync.bug,
+                    f"Pushed to try{' (stability)' if stability else ''} "
+                    + f"https://treeherder.mozilla.org/jobs?repo=try&landoInstance=lando-prod-2025&landoCommitID={job_id}",
+                )
 
         return rv
 
@@ -423,6 +465,46 @@ class TryPush(base.ProcessData):
             return cls(git_gecko, process_name)
         return None
 
+    @classmethod
+    def for_task(cls, git_gecko: Repo, task: Mapping[str, Any]) -> Optional[Self]:
+        """Get the try push that a task belongs to, using the token we add to the try
+        commit message, which is what the decision task is passed.
+
+        :param task: Task definition, as returned by the Taskcluster queue
+        """
+        commit_msg = task.get("payload", {}).get("env", {}).get("GECKO_COMMIT_MSG")
+        if commit_msg is None:
+            return None
+
+        match = re.compile(
+            r"^%s: (?P<token>\S+)$" % re.escape("wptsync-try-push"), re.MULTILINE
+        ).search(commit_msg)
+
+        if match is None:
+            return None
+        else:
+            token = match.group("token")
+
+        parts = token.split("/")
+        if len(parts) != 3:
+            logger.warning(f"Unexpected try push token {token}")
+            return None
+        subtype, obj_id, _ = parts
+        # The token contains the sync, so only its try pushes can match
+        process_names = base.ProcessNameIndex(git_gecko).get(cls.obj_type, subtype, obj_id)
+        for process_name in process_names:
+            try_push = cls(git_gecko, process_name)
+            if try_push.token == token:
+                logger.info(f"Found try push {process_name!r} for token {token}")
+                return try_push
+        logger.info(f"No try push for token {token}")
+        return None
+
+    @property
+    def token(self) -> str | None:
+        """Token identifying this try push in its commit message on try"""
+        return self.get("try-token")
+
     @property
     def treeherder_url(self) -> str:
         return "https://treeherder.mozilla.org/#/jobs?repo=try&revision=%s" % self.try_rev
@@ -446,9 +528,55 @@ class TryPush(base.ProcessData):
         idx = TryCommitIndex(self.repo)
         if self.try_rev is not None:
             idx.delete(idx.make_key(self.try_rev), self.process_name)
-        self._data["try-rev"] = value
-        assert self.try_rev is not None
-        idx.insert(idx.make_key(self.try_rev), self.process_name)
+        self["try-rev"] = value
+        idx.insert(idx.make_key(value), self.process_name)
+
+    def poll_try_rev(self) -> str | None:
+        """Ask Lando once for the revision it created on try, if we don't have it yet.
+
+        :return: The revision on try, or None if it's still unknown
+        """
+        if self.try_rev is not None or self.status != "open":
+            return self.try_rev
+        job_id = self.get("lando-job-id")
+        if job_id is None:
+            logger.warning(
+                "Try push %s has no revision and no Lando job to get it from" % self.process_name
+            )
+            return None
+
+        try:
+            try_rev = try_rev_from_job(job_id, env.lando.landing_job(job_id))
+        except AbortError as e:
+            with SyncLock.for_process(self.process_name) as lock:
+                assert isinstance(lock, SyncLock)
+                with self.as_mut(lock):
+                    self.status = "complete"
+                    self.infra_fail = True
+                    bug = self.get("bug")
+                    if bug is not None:
+                        env.bz.comment(bug, "Try push failed to land: %s" % e.message)
+            return None
+        except Exception:
+            # Don't allow a problem with one try push to stop us handling the others
+            logger.error(
+                "Failed to get Lando job %s for try push %s:\n%s"
+                % (job_id, self.process_name, traceback.format_exc())
+            )
+            return None
+
+        if try_rev is None:
+            logger.info(
+                "Lando job %s for try push %s hasn't landed yet" % (job_id, self.process_name)
+            )
+            return None
+
+        with SyncLock.for_process(self.process_name) as lock:
+            assert isinstance(lock, SyncLock)
+            with self.as_mut(lock):
+                logger.info("Try push %s landed on try as %s" % (self.process_name, try_rev))
+                self.try_rev = try_rev
+        return try_rev
 
     @property
     def taskgroup_id(self) -> str | None:

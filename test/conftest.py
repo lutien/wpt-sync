@@ -563,7 +563,7 @@ def mock_try_push(git_gecko):
 
     def push(self):
         log.append(f"Pushing to try with message:\n{self.worktree.head.commit.message}")
-        return repos.cinnabar(git_gecko).git2hg(self.worktree.commit("HEAD~").hexsha)
+        return None, repos.cinnabar(git_gecko).git2hg(self.worktree.commit("HEAD~").hexsha)
 
     trypush.TryCommit.push = push
 
@@ -772,7 +772,8 @@ def MockTryCls():
             pass
 
         def push(self):
-            return "".join(hex(random.randint(0, 15))[2:] for _ in range(40))
+            try_rev = "".join(hex(random.randint(0, 15))[2:] for _ in range(40))
+            return 1, try_rev
 
     return MockTryPush
 

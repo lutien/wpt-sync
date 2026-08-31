@@ -41,6 +41,9 @@ def test_try_push_patches(env, try_push):
     patches = [base64.b64decode(item).decode("utf8") for item in lando_push["patches"]]
     assert patches
     assert "try_task_config.json" in patches[-1]
+    # The try commit is the last one in the push, so its message is the one that gets
+    # passed to the decision task
+    assert f"wptsync-try-push: {try_push.token}" in patches[-1]
 
 
 def test_try_task_states(mock_tasks, try_push):

@@ -99,6 +99,8 @@ class MockLando(Lando):
         self.hg_to_git: dict[str, Optional[str]] = {}
         self.git_to_hg: dict[str, Optional[str]] = {}
         self.try_pushes: list[Mapping[str, Any]] = []
+        self.job_status: dict[int, str] = {}
+        self.default_job_status = "LANDED"
 
     def try_push(
         self,
@@ -119,10 +121,11 @@ class MockLando(Lando):
     def landing_job(self, job_id: int) -> Mapping[str, Any]:
         if not 0 < job_id <= len(self.try_pushes):
             raise ValueError(f"Lando has no job with id {job_id}")
+        status = self.job_status.get(job_id, self.default_job_status)
         return {
             "id": job_id,
-            "status": "LANDED",
-            "commit_id": "%040x" % job_id,
+            "status": status,
+            "commit_id": "%040x" % job_id if status == "LANDED" else None,
             "error": "",
             "url": urljoin(self.base_url, f"/landings/{job_id}"),
         }

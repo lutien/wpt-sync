@@ -1,25 +1,22 @@
 import base64
-import json
 import re
 from unittest.mock import Mock, patch
 
 from sync import tc, trypush
 from sync.lock import SyncLock
-from conftest import mach_try_output
 
 
-def test_read_try_task_config(env, git_gecko):
-    try_commit = trypush.TryFuzzyCommit(git_gecko, git_gecko, None, 0, hacks=False)
-    message, try_task_config = try_commit.read_try_task_config(
-        mach_try_output.decode("utf8", "replace")
+def test_commit_message(env, git_gecko):
+    try_commit = trypush.TryFuzzyCommit(
+        git_gecko, git_gecko, None, 0, hacks=False, token="downstream/1234/abcdef"
     )
+    message = try_commit.commit_message(["testing/web-platform/tests/example"])
 
-    assert message.startswith("Fuzzy query=web-platform-tests")
-    assert message.endswith("Pushed via `mach try fuzzy`")
-    assert json.loads(try_task_config)["parameters"]["try_task_config"]["tasks"] == [
-        "test-linux2404-64/debug-web-platform-tests-1",
-        "test-linux2404-64/opt-web-platform-tests-1",
-    ]
+    assert message == (
+        "Fuzzy query=web-platform-tests !macosx !shippable !asan !tsan"
+        "&paths=testing/web-platform/tests/example\n\n"
+        "wptsync-try-push: downstream/1234/abcdef"
+    )
 
 
 def test_read_try_rev(env, git_gecko):
@@ -40,7 +37,9 @@ def test_try_push_patches(env, try_push):
 
     patches = [base64.b64decode(item).decode("utf8") for item in lando_push["patches"]]
     assert patches
+    # The try commit contains the try_task_config.json written by mach try
     assert "try_task_config.json" in patches[-1]
+    assert "test-linux2404-64/opt-web-platform-tests-1" in patches[-1]
     # The try commit is the last one in the push, so its message is the one that gets
     # passed to the decision task
     assert f"wptsync-try-push: {try_push.token}" in patches[-1]

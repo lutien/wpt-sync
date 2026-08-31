@@ -92,7 +92,7 @@ def test_land_try(
         "web-platform-tests mac !debug shippable",
         "--disable-target-task-filter",
         "--artifact",
-        "--no-push",
+        "--write-task-config",
     )
 
 

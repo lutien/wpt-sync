@@ -1,6 +1,5 @@
 from __future__ import annotations
 import base64
-import json
 import os
 import re
 import shutil
@@ -40,10 +39,6 @@ logger = log.get_logger(__name__)
 env = Environment()
 
 auth_tc = tc.TaskclusterClient()
-try_output_re = re.compile(
-    r"^Commit message:\n(?P<message>.*?)\n^Calculated try_task_config\.json:\n",
-    re.MULTILINE | re.DOTALL,
-)
 
 
 def try_rev_from_job(job_id: int, job: Mapping[str, Any]) -> str | None:
@@ -196,16 +191,38 @@ class TryFuzzyCommit(TryCommit):
             self.worktree.index.commit(message="Apply task hacks before running try")
 
     def _push(self) -> int:
-        status, output = self.run_mach_try()
+        paths = self.test_paths()
+        status, output = self.run_mach_try(paths)
         if status != 0:
             msg = f"Failed to run mach try:\n{output}"
             logger.error(msg)
             raise RetryableError(AbortError(msg))
-        message, try_task_config = self.read_try_task_config(output)
-        self.create_try_commit(message, try_task_config)
+        self.create_try_commit(self.commit_message(paths))
         return self.push_to_lando()
 
-    def run_mach_try(self) -> tuple[int, str]:
+    def test_paths(self) -> list[str]:
+        """Paths of the affected tests to pass to mach try, capped at the
+        configured maximum number of tests."""
+        if self.tests_by_type is None:
+            return []
+
+        working_dir = self.worktree.working_dir
+        assert working_dir is not None
+
+        paths = []
+        all_paths = set()
+        for values in self.tests_by_type.values():
+            for item in values:
+                if item not in all_paths and os.path.exists(os.path.join(working_dir, item)):
+                    paths.append(item)
+                all_paths.add(item)
+        max_tests = env.config["gecko"]["try"].get("max-tests")
+        if max_tests and len(paths) > max_tests:
+            logger.warning("Capping number of affected tests at %d" % max_tests)
+            paths = paths[:max_tests]
+        return paths
+
+    def run_mach_try(self, paths: list[str]) -> tuple[int, str]:
         self.worktree.git.reset("--hard")
 
         working_dir = self.worktree.working_dir
@@ -243,23 +260,12 @@ class TryFuzzyCommit(TryCommit):
         else:
             args.append("--no-artifact")
 
-        # --no-push means mach only computes the try_task_config.json and the commit
-        # message; making the commit and pushing it to try is handled here instead
-        args.append("--no-push")
+        # --write-task-config means mach only writes try_task_config.json to the root
+        # of the worktree; making the commit and pushing it to try is handled here
+        # instead
+        args.append("--write-task-config")
 
-        if self.tests_by_type is not None:
-            paths = []
-            all_paths = set()
-            for values in self.tests_by_type.values():
-                for item in values:
-                    if item not in all_paths and os.path.exists(os.path.join(working_dir, item)):
-                        paths.append(item)
-                    all_paths.add(item)
-            max_tests = env.config["gecko"]["try"].get("max-tests")
-            if max_tests and len(paths) > max_tests:
-                logger.warning("Capping number of affected tests at %d" % max_tests)
-                paths = paths[:max_tests]
-            args.extend(paths)
+        args.extend(paths)
 
         try:
             output = mach.try_(*args, stderr=subprocess.STDOUT)
@@ -267,43 +273,32 @@ class TryFuzzyCommit(TryCommit):
         except subprocess.CalledProcessError as e:
             return e.returncode, e.output.decode("utf8", "replace")
 
-    def read_try_task_config(self, output: str) -> tuple[str, str]:
-        """Read the commit message and the try_task_config.json content from the
-        output of `mach try fuzzy --no-push`
-
-        :return: Tuple of (commit message, try_task_config.json content)
-        """
-        match = try_output_re.search(output)
-        if match is None:
-            msg = f"Failed to read the try commit message from mach output:\n{output}"
-            logger.error(msg)
-            raise AbortError(msg)
-        try:
-            # The config is the first JSON object after the header line, but it's
-            # followed by other output, so just decode as much as parses
-            try_task_config, _ = json.JSONDecoder().raw_decode(output[match.end() :])
-        except ValueError:
-            msg = f"Failed to read try_task_config.json from mach output:\n{output}"
-            logger.error(msg)
-            raise AbortError(msg)
-
-        content = (
-            json.dumps(try_task_config, indent=4, separators=(",", ": "), sort_keys=True) + "\n"
-        )
-        return match.group("message"), content
-
-    def create_try_commit(self, message: str, try_task_config: str) -> None:
-        working_dir = self.worktree.working_dir
-        assert working_dir is not None
+    def commit_message(self, paths: list[str]) -> str:
+        """Message for the try commit, in the same format as the one `mach try fuzzy`
+        generates when it makes the commit itself."""
+        args = [f"query={query}" for query in self.queries]
+        if paths:
+            args.append("paths={}".format(":".join(paths)))
+        message = "Fuzzy {}".format("&".join(args))
 
         if self.token is not None:
             # This is the last commit in the push, so its message is the one that's
             # passed to the decision task.
             message = f"{message}\n\n{f'wptsync-try-push: {self.token}'}"
 
+        return message
+
+    def create_try_commit(self, message: str) -> None:
+        working_dir = self.worktree.working_dir
+        assert working_dir is not None
+
         try_task_config_path = "try_task_config.json"
-        with open(os.path.join(working_dir, try_task_config_path), "w") as f:
-            f.write(try_task_config)
+
+        if not os.path.exists(os.path.join(working_dir, try_task_config_path)):
+            msg = f"mach try didn't write {try_task_config_path}"
+            logger.error(msg)
+            raise AbortError(msg)
+
         self.worktree.index.add([try_task_config_path])
         self.worktree.index.commit(message=message)
         logger.info(

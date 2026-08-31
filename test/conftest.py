@@ -33,18 +33,7 @@ from sync.lock import SyncLock
 
 here = os.path.abspath(os.path.dirname(__file__))
 
-mach_try_output = b"""warning: paths to individual tests may not work, re-writing to \
-testing/web-platform/tests/example. Pass --allow-testfile-path to override
-Commit message:
-Fuzzy query=web-platform-tests !macosx !shippable !asan !tsan\
-&paths=testing/web-platform/tests/example
-
-mach try command: `./mach try fuzzy -q "web-platform-tests !macosx !shippable !asan !tsan" \
---artifact --no-push`
-
-Pushed via `mach try fuzzy`
-Calculated try_task_config.json:
-{
+try_task_config = """{
     "parameters": {
         "optimize_target_tasks": false,
         "try_task_config": {
@@ -61,6 +50,20 @@ Calculated try_task_config.json:
     "version": 2
 }
 """
+
+
+def mach_try(mach, *args, **kwargs):
+    """Mock `mach try`, which with --write-task-config writes try_task_config.json
+    to the root of the source tree instead of pushing to try"""
+    if "--write-task-config" not in args:
+        return b""
+    path = os.path.join(mach.path, "try_task_config.json")
+    with open(path, "w") as f:
+        f.write(try_task_config)
+    return b"""warning: paths to individual tests may not work, re-writing to \
+testing/web-platform/tests/example. Pass --allow-testfile-path to override
+Wrote %s
+""" % path.encode("utf8")
 
 
 def create_file_data(file_data, repo_workdir, repo_prefix=None):
@@ -541,7 +544,7 @@ def mock_mach():
     from sync import projectutil
 
     cls = projectutil.create_mock("mach")
-    cls.set_data("try", mach_try_output)
+    cls.set_data("try", mach_try)
     projectutil.Mach = cls
     return cls
 

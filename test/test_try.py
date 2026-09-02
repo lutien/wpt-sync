@@ -6,19 +6,6 @@ from sync import tc, trypush
 from sync.lock import SyncLock
 
 
-def test_commit_message(env, git_gecko):
-    try_commit = trypush.TryFuzzyCommit(
-        git_gecko, git_gecko, None, 0, hacks=False, token="downstream/1234/abcdef"
-    )
-    message = try_commit.commit_message(["testing/web-platform/tests/example"])
-
-    assert message == (
-        "Fuzzy query=web-platform-tests !macosx !shippable !asan !tsan"
-        "&paths=testing/web-platform/tests/example\n\n"
-        "wptsync-try-push: downstream/1234/abcdef"
-    )
-
-
 def test_read_try_rev(env, git_gecko):
     try_commit = trypush.TryFuzzyCommit(git_gecko, git_gecko, None, 0, hacks=False)
     job_id = env.lando.try_push(["patch"], "0" * 40)
@@ -40,9 +27,27 @@ def test_try_push_patches(env, try_push):
     # The try commit contains the try_task_config.json written by mach try
     assert "try_task_config.json" in patches[-1]
     assert "test-linux2404-64/opt-web-platform-tests-1" in patches[-1]
-    # The try commit is the last one in the push, so its message is the one that gets
-    # passed to the decision task
-    assert f"wptsync-try-push: {try_push.token}" in patches[-1]
+
+
+def test_try_push_for_task(git_gecko, try_push):
+    task = {"payload": {"env": {"WPTSYNC_TRY_PUSH_TOKEN": try_push.token}}}
+
+    assert trypush.TryPush.for_task(git_gecko, task) == try_push
+
+
+def test_try_push_for_task_selects_exact_push(git_gecko, git_wpt, try_push, MockTryCls):
+    sync = try_push.sync(git_gecko, git_wpt)
+    assert sync is not None
+    with SyncLock.for_process(sync.process_name) as lock:
+        with sync.as_mut(lock):
+            second_try_push = trypush.TryPush.create(
+                lock, sync, hacks=False, try_cls=MockTryCls, check_open=False
+            )
+
+    task = {"payload": {"env": {"WPTSYNC_TRY_PUSH_TOKEN": second_try_push.token}}}
+
+    assert second_try_push.token != try_push.token
+    assert trypush.TryPush.for_task(git_gecko, task) == second_try_push
 
 
 def test_try_task_states(mock_tasks, try_push):

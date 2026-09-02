@@ -57,9 +57,18 @@ def mach_try(mach, *args, **kwargs):
     to the root of the source tree instead of pushing to try"""
     if "--write-task-config" not in args:
         return b""
+
+    task_config = json.loads(try_task_config)
+    task_env = task_config["parameters"]["try_task_config"]["env"]
+    for idx, arg in enumerate(args):
+        if arg == "--env":
+            name, value = args[idx + 1].split("=", 1)
+            task_env[name] = value
+
     path = os.path.join(mach.path, "try_task_config.json")
     with open(path, "w") as f:
-        f.write(try_task_config)
+        json.dump(task_config, f, indent=4, sort_keys=True)
+        f.write("\n")
     return b"""warning: paths to individual tests may not work, re-writing to \
 testing/web-platform/tests/example. Pass --allow-testfile-path to override
 Wrote %s

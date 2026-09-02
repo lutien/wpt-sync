@@ -1,7 +1,6 @@
 from __future__ import annotations
 import base64
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -253,6 +252,8 @@ class TryFuzzyCommit(TryCommit):
             args.append("--full")
         if self.disable_target_task_filter:
             args.append("--disable-target-task-filter")
+        if self.token is not None:
+            args.extend(["--env", f"WPTSYNC_TRY_PUSH_TOKEN={self.token}"])
         if can_push_routes:
             args.append("--route=notify.pulse.wptsync.try-task.on-any")
         if self.artifact:
@@ -279,14 +280,7 @@ class TryFuzzyCommit(TryCommit):
         args = [f"query={query}" for query in self.queries]
         if paths:
             args.append("paths={}".format(":".join(paths)))
-        message = "Fuzzy {}".format("&".join(args))
-
-        if self.token is not None:
-            # This is the last commit in the push, so its message is the one that's
-            # passed to the decision task.
-            message = f"{message}\n\n{f'wptsync-try-push: {self.token}'}"
-
-        return message
+        return "Fuzzy {}".format("&".join(args))
 
     def create_try_commit(self, message: str) -> None:
         working_dir = self.worktree.working_dir
@@ -462,23 +456,9 @@ class TryPush(base.ProcessData):
 
     @classmethod
     def for_task(cls, git_gecko: Repo, task: Mapping[str, Any]) -> Optional[Self]:
-        """Get the try push that a task belongs to, using the token we add to the try
-        commit message, which is what the decision task is passed.
-
-        :param task: Task definition, as returned by the Taskcluster queue
-        """
-        commit_msg = task.get("payload", {}).get("env", {}).get("GECKO_COMMIT_MSG")
-        if commit_msg is None:
+        token = task.get("payload", {}).get("env", {}).get("WPTSYNC_TRY_PUSH_TOKEN")
+        if not isinstance(token, str):
             return None
-
-        match = re.compile(
-            r"^%s: (?P<token>\S+)$" % re.escape("wptsync-try-push"), re.MULTILINE
-        ).search(commit_msg)
-
-        if match is None:
-            return None
-        else:
-            token = match.group("token")
 
         parts = token.split("/")
         if len(parts) != 3:
@@ -497,7 +477,7 @@ class TryPush(base.ProcessData):
 
     @property
     def token(self) -> str | None:
-        """Token identifying this try push in its commit message on try"""
+        """ID identifying this try push in Taskcluster task environments."""
         return self.get("try-token")
 
     @property
